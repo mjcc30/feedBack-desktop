@@ -1744,15 +1744,25 @@ int main(int argc, char** argv)
     // load) skips the join — TerminateProcess/_Exit ends every thread anyway.
     std::thread heartbeatThread([&st, &loadDone]
     {
-        constexpr int kHeartbeatSlices = 50;   // 50 * 100ms ≈ 5s between beats
-        while (!loadDone.load(std::memory_order_acquire))
+        // Thread entry point: never let an exception escape — an uncaught
+        // C++ exception calls std::terminate and kills the child (the host
+        // would see a crash instead of a clean load failure).
+        try
         {
-            for (int i = 0; i < kHeartbeatSlices
-                            && !loadDone.load(std::memory_order_acquire); ++i)
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            if (loadDone.load(std::memory_order_acquire))
-                break;
-            st.control.sendEvent(event::kLoading, {});
+            constexpr int kHeartbeatSlices = 50;   // 50 * 100ms ≈ 5s between beats
+            while (!loadDone.load(std::memory_order_acquire))
+            {
+                for (int i = 0; i < kHeartbeatSlices
+                                && !loadDone.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (loadDone.load(std::memory_order_acquire))
+                    break;
+                st.control.sendEvent(event::kLoading, {});
+            }
+        }
+        catch (...)
+        {
+            hostLogf("heartbeat thread: swallowed exception");
         }
     });
 
@@ -1817,13 +1827,19 @@ int main(int argc, char** argv)
         const int shmCh = (int)st.audio.dims().maxChannels;
         if (pMax > (int)kAudioMaxChannels)
         {
-            // Fail closed against the absolute protocol cap. A plugin
-            // reporting >kAudioMaxChannels means our protocol literally
-            // can't represent its topology.
-            hostLogf("plugin reports %d channels, exceeding protocol cap %d",
-                     pMax, (int)kAudioMaxChannels);
-            st.control.sendEvent(event::kGoodbye, {});
-            return 5;
+            // A plugin reporting more channels than the protocol cap can't be
+            // represented end-to-end — but refusing to load it would make any
+            // such plugin (cracked or not) unusable, while DAWs simply clamp
+            // the worker to what the ring carries. Clamp loudly instead of
+            // failing closed: the effective width below (min(pMax, shmCh))
+            // keeps every buffer inside the protocol caps, so the plugin sees
+            // zero-padded input on its extra channels and their output is
+            // dropped — degraded, never fatal.
+            hostLogf("WARNING: plugin reports %d channels, exceeding protocol "
+                     "cap %d — clamping worker to the SHM ring width %d. "
+                     "Plugin's extra channels will see zero-padded input and "
+                     "their output will be dropped.",
+                     pMax, (int)kAudioMaxChannels, shmCh);
         }
         // The SHM ring width is fixed at spawn time (SandboxFactory_win
         // currently hardcodes 2; cf. the deferred BusesProperties
@@ -1871,7 +1887,15 @@ int main(int argc, char** argv)
     // the control I/O thread always has a worker to ack the pause flag —
     // otherwise an early kPrepare would deadlock in AudioPauseGuard waiting
     // forever on audioPausedAck.
-    st.audioThread = std::thread([&st] { runAudioThread(st); });
+    st.audioThread = std::thread([&st]
+    {
+        // Thread entry point: never let an exception escape — an uncaught
+        // C++ exception (e.g. a plugin throwing from processBlock) calls
+        // std::terminate and kills the child; the host would see a crash
+        // instead of silence.
+        try { runAudioThread(st); }
+        catch (...) { hostLogf("audio thread: swallowed exception"); }
+    });
 
     auto stopAudioWorker = [&st]
     {

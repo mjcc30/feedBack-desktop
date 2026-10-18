@@ -339,7 +339,7 @@ struct HostState
     std::thread audioThread;
     std::atomic<int> sampleRate{48000};
     std::atomic<int> blockSize{256};
-    int channels = 2;                   // const after argv parse — main thread only
+    int channels = 2;                   // worker buffer width — argv hint, resized at load to the plugin's channel count; main thread only, before the audio thread starts
 
     std::atomic<bool>    audioPauseRequested{false};
     juce::WaitableEvent  audioPausedAck;    // audio thread → control thread
@@ -1812,54 +1812,54 @@ int main(int argc, char** argv)
         return 5;
     }
     hostLogf("plugin loaded: %s", st.plugin->getName().toRawUTF8());
-    // Clamp the audio worker's channel count to what the plugin actually
+    // Size the audio worker's channel count to what the plugin actually
     // reports. spawn-time --channels is a hint (the host doesn't know the
     // real topology until the plugin loads); using the plugin's
-    // getTotalNumIn/OutChannels prevents undersized buffers being passed
-    // to a mono effect or extra silent channels for a >stereo synth.
-    // BusesProperties-aware buffer sizing is the deferred follow-up;
-    // until then take the max of in/out so the buffer is at least big
-    // enough for either direction.
+    // getTotalNumIn/OutChannels guarantees the buffer handed to
+    // processBlock is wide enough for either direction. A buffer NARROWER
+    // than the plugin's enabled buses makes processBlock write out of
+    // bounds — observed with a cracked plugin reporting 32 stereo output
+    // buses while the worker ran on a 2-channel buffer: the OOB write
+    // threw on the audio thread, the thread-level catch-all killed
+    // runAudioThread, and the host heard permanent silence while the slot
+    // stayed active.
+    // The SHM ring width stays fixed at spawn time (SandboxFactory_win
+    // currently hardcodes 2; cf. the deferred BusesProperties refactor
+    // that would size SHM from the plugin's reported topology). Only the
+    // ring TRANSFER is clamped, never the worker buffer: popInputBlock
+    // zero-pads the worker buffer's channels beyond header->maxChannels
+    // and pushBlock drops the worker buffer's extra output channels (both
+    // cap at header->maxChannels), so the main bus round-trips intact.
     {
+        // Hard ceiling on the worker buffer width: a plugin (cracked or
+        // hostile) reporting an absurd channel count must not be able to
+        // make us allocate an absurd buffer. 256ch x 1024 samples x 4B
+        // stays ~1MB — same order of magnitude as today's rings.
+        constexpr int kMaxWorkerChannels = 256;
         const int pIn  = st.plugin->getTotalNumInputChannels();
         const int pOut = st.plugin->getTotalNumOutputChannels();
         const int pMax = juce::jmax(pIn, pOut);
         const int shmCh = (int)st.audio.dims().maxChannels;
-        if (pMax > (int)kAudioMaxChannels)
+        // Worker buffer follows the plugin, but never below the ring
+        // width (a narrower buffer would break the transfer) and never
+        // above kMaxWorkerChannels.
+        const int effective = juce::jmax(shmCh, juce::jmin(pMax, kMaxWorkerChannels));
+        if (pMax > kMaxWorkerChannels)
         {
-            // A plugin reporting more channels than the protocol cap can't be
-            // represented end-to-end — but refusing to load it would make any
-            // such plugin (cracked or not) unusable, while DAWs simply clamp
-            // the worker to what the ring carries. Clamp loudly instead of
-            // failing closed: the effective width below (min(pMax, shmCh))
-            // keeps every buffer inside the protocol caps, so the plugin sees
-            // zero-padded input on its extra channels and their output is
-            // dropped — degraded, never fatal.
-            hostLogf("WARNING: plugin reports %d channels, exceeding protocol "
-                     "cap %d — clamping worker to the SHM ring width %d. "
-                     "Plugin's extra channels will see zero-padded input and "
-                     "their output will be dropped.",
-                     pMax, (int)kAudioMaxChannels, shmCh);
+            hostLogf("WARNING: plugin reports %d channels, exceeding the "
+                     "worker buffer cap %d — clamping worker to %d. Channels "
+                     "beyond the SHM ring width %d see zero-padded input and "
+                     "have their output dropped.",
+                     pMax, kMaxWorkerChannels, effective, shmCh);
         }
-        // The SHM ring width is fixed at spawn time (SandboxFactory_win
-        // currently hardcodes 2; cf. the deferred BusesProperties
-        // refactor that would size SHM from the plugin's reported
-        // topology). If the plugin reports more channels than the ring
-        // can carry, the audio worker runs with a clamped buffer:
-        // pushBlock/popBlock cap at header->maxChannels and the plugin
-        // sees zero-padded input on its extra channels. Today's only
-        // sandboxed plugin (Guitar Rig 6) reports 4-channel topology
-        // (sidechain) but works fine on 2-channel buffers, so clamping
-        // is the pragmatic choice — loudly logged so the limitation is
-        // visible in the diagnostic trail.
-        const int effective = juce::jmin(pMax, shmCh);
-        if (pMax > shmCh)
+        else if (pMax > shmCh)
         {
             hostLogf("WARNING: plugin reports %d channels but SHM ring width "
-                     "is %d — clamping to %d. Plugin's extra channels will "
-                     "see zero-padded input and their output will be dropped. "
-                     "Deferred fix: BusesProperties refactor sizes SHM from "
-                     "plugin topology.", pMax, shmCh, effective);
+                     "is %d — worker buffer sized to the plugin (%d), SHM "
+                     "transfer clamped to %d. Extra channels see zero-padded "
+                     "input and have their output dropped. Deferred fix: "
+                     "BusesProperties refactor sizes SHM from plugin topology.",
+                     pMax, shmCh, effective, shmCh);
         }
         if (effective > 0 && effective != st.channels)
         {

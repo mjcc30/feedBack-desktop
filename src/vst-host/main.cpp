@@ -603,6 +603,11 @@ void runAudioThread(HostState& st)
     buffer.setSize(st.channels, currentBlockSize,
                    /*keep*/false, /*clear*/true, /*avoidRealloc*/true);
     juce::MidiBuffer midi;
+    // Counts processBlock exceptions contained per block (see the try/catch
+    // around the processBlock call below): a faulting plugin must not kill
+    // this thread — the worker stays alive and pushes silence for the
+    // faulting block.
+    juce::uint64 processFaults = 0;
     while (st.running.load(std::memory_order_acquire))
     {
         if (st.audioPauseRequested.load(std::memory_order_acquire))
@@ -677,7 +682,23 @@ void runAudioThread(HostState& st)
             // amp/EQ/comp IIR tails spike CPU and stutter the audio. (Key fix for
             // the user's all-VST chains.)
             const juce::ScopedNoDenormals noDenormals;
-            p->processBlock(buffer, midi);
+            // Contain plugin exceptions PER BLOCK. Letting one escape would
+            // unwind runAudioThread into the thread-level catch-all: the
+            // worker stops consuming input, the host's popBlock times out
+            // and xruns forever — permanent silence while the slot stays
+            // active (exactly what a channel-count mismatch used to cause).
+            // Push silence for the faulting block and keep the worker
+            // alive; the thread-level catch-all stays as the last resort.
+            try { p->processBlock(buffer, midi); }
+            catch (...)
+            {
+                buffer.clear();
+                const juce::uint64 faults = ++processFaults;
+                if (faults <= 3 || faults % 1000 == 0)
+                    hostLogf("processBlock threw (fault #%llu) — pushed "
+                             "silence, worker alive",
+                             (unsigned long long)faults);
+            }
         }
         st.audio.pushBlock(/*isOutputRing=*/true, buffer, currentBlockSize);
     }

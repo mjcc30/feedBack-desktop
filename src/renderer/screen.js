@@ -11,7 +11,7 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
     if (!api) {
         console.error('[audio-engine] Desktop audio API not available — running in browser mode');
         const panel = document.getElementById('audio-engine-panel');
-        if (panel) panel.innerHTML = '<div class="p-8 text-center text-slate-400">Audio engine is only available in the Slopsmith Desktop app.</div>';
+        if (panel) panel.innerHTML = '<div class="p-8 text-center text-slate-400">Audio engine is only available in the feedBack Desktop app.</div>';
         return;
     }
 
@@ -392,7 +392,19 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
                 const wantType = typeInfo && typeInfo.name ? String(typeInfo.name) : '';
                 if (curInput && curInput.trim() === String(inputDevice).trim()
                     && (!wantType || curType === wantType)) {
-                    return { outcome: 'handled', status: 'open', payload: { boundType: curType || wantType, boundName: curInput, requestedName: inputDevice, alreadyBound: true } };
+                    // Reflect the live engine's rate/buffer in the panel too —
+                    // ASIO drivers ignore buffer changes while open, so the
+                    // selects must show what the engine ACTUALLY runs.
+                    if (cur.blockSize > 0) setSelectValueIfPresent(bufferSizeSelect, cur.blockSize);
+                    if (cur.sampleRate > 0) setSelectValueIfPresent(sampleRateSelect, cur.sampleRate);
+                    return { outcome: 'handled', status: 'open', payload: {
+                        boundType: curType || wantType,
+                        boundName: curInput,
+                        boundSampleRate: cur.sampleRate > 0 ? Number(cur.sampleRate) : null,
+                        boundBlockSize: cur.blockSize > 0 ? Number(cur.blockSize) : null,
+                        requestedName: inputDevice,
+                        alreadyBound: true,
+                    } };
                 }
             }
         } catch (_) { /* engine state unreadable — fall through to the normal (re)bind path */ }
@@ -415,17 +427,29 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
         // and spot a silent mismatch instead of trusting the request blind.
         let boundType = (typeInfo && typeInfo.name) ? String(typeInfo.name) : '';
         let boundName = inputDevice;
+        let boundSampleRate = null;
+        let boundBlockSize = null;
         try {
             if (typeof api.getCurrentDevice === 'function') {
                 const cur = await api.getCurrentDevice();
                 if (cur && typeof cur === 'object') {
                     if (cur.inputType) boundType = String(cur.inputType);
                     if (cur.input) boundName = String(cur.input);
+                    if (cur.sampleRate > 0) boundSampleRate = Number(cur.sampleRate);
+                    if (cur.blockSize > 0) boundBlockSize = Number(cur.blockSize);
                 }
             }
         } catch (_) { /* fall back to the requested identity */ }
 
-        return { outcome: 'handled', status: 'open', payload: { boundType, boundName, requestedName: inputDevice } };
+        // ASIO drivers ignore buffer-size changes while the device is open, so
+        // the engine can end up running a different blockSize/sampleRate than
+        // requested (e.g. a Focusrite bound at 256 when 64 was asked). Reflect
+        // the ACTUAL bound values in the panel selects — never show a buffer
+        // size the engine is not running.
+        if (boundBlockSize != null) setSelectValueIfPresent(bufferSizeSelect, boundBlockSize);
+        if (boundSampleRate != null) setSelectValueIfPresent(sampleRateSelect, boundSampleRate);
+
+        return { outcome: 'handled', status: 'open', payload: { boundType, boundName, boundSampleRate, boundBlockSize, requestedName: inputDevice } };
     }
 
     async function audioInputCloseHandler() {
@@ -975,6 +999,42 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
         setupEvents();
         startMetering();
 
+        // Hydrate the panel from the engine's REAL state. The native engine
+        // lives in the main process and can already be running when this
+        // screen is evaluated — e.g. the calibration wizard opened the input
+        // device and left it on. Without this, audioRunning stays false and
+        // the panel claims "engine stopped / settings not applied" while
+        // audio is actually flowing (and the Start/Stop button would START a
+        // second stream instead of stopping the live one).
+        try {
+            if (typeof api.isAudioRunning === 'function' && await api.isAudioRunning()) {
+                audioRunning = true;
+                toggleBtn.textContent = 'Stop';
+                statusDot.className = 'w-3 h-3 rounded-full bg-emerald-500';
+                statusText.textContent = 'Audio running';
+            }
+            if (typeof api.getCurrentDevice === 'function') {
+                const live = await api.getCurrentDevice();
+                if (live && typeof live === 'object' && (live.input || live.type || live.inputType)) {
+                    rememberAppliedDeviceSettings({
+                        inputType: live.inputType || live.type || '',
+                        outputType: live.outputType || live.type || live.inputType || '',
+                        input: live.input != null ? String(live.input) : '',
+                        output: live.output != null ? String(live.output) : '',
+                        sampleRate: live.sampleRate > 0 ? String(live.sampleRate) : '',
+                        bufferSize: live.blockSize > 0 ? String(live.blockSize) : '',
+                    });
+                    // Reflect the live engine's rate/buffer in the selects too —
+                    // the probe defaults (first option) say nothing about what
+                    // the running engine actually uses.
+                    if (live.sampleRate > 0) setSelectValueIfPresent(sampleRateSelect, live.sampleRate);
+                    if (live.blockSize > 0) setSelectValueIfPresent(bufferSizeSelect, live.blockSize);
+                }
+            }
+        } catch (e) {
+            console.warn('[audio-engine] Engine-state hydration failed:', e);
+        }
+
         const saved = await loadDeviceSettings();
         if (saved) {
             const savedInputType  = saved.inputType  || saved.type || '';
@@ -1058,6 +1118,17 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
                     syncSelectedInputSource(deviceTypeSelect.value, inputDeviceSelect.value);
                 }
             }
+        }
+
+        // Fresh profile (no saved monitorMute): default direct monitoring to
+        // AUDIBLE. The HTML default leaves "Mute direct monitoring" checked
+        // and the native engine boots with monitorMuted{true}, so a first-run
+        // user hears silence until they find this toggle by hand. A saved
+        // preference always wins — this only fires when nothing was saved.
+        if (!saved || saved.monitorMute === undefined) {
+            monitorMuteCheckbox.checked = false;
+            try { await api.setMonitorMute(false); }
+            catch (e) { console.warn('[audio-engine] setMonitorMute fresh-default failed:', e); }
         }
 
         // Amp-sim opt-in gate (feedBack-desktop#46). Only auto-load a tone chain
@@ -2015,7 +2086,7 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
                 if (configDirEl) configDirEl.textContent = `Active config: ${info.configDir}`;
                 if (libraryPathEl && info.dlcDir) libraryPathEl.textContent = `(${info.dlcDir})`;
                 if (sharedWarn && info.sharedDockerConfig) {
-                    sharedWarn.textContent = 'Heads up: this config is shared with a Docker Slopsmith install — a full reset affects both.';
+                    sharedWarn.textContent = 'Heads up: this config is shared with a Docker feedBack install — a full reset affects both.';
                     sharedWarn.classList.remove('hidden');
                 }
             } catch (e) {

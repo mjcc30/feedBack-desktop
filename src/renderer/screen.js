@@ -409,18 +409,62 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
             }
         } catch (_) { /* engine state unreadable — fall through to the normal (re)bind path */ }
 
+        // Resolve output/rate/buffer from the PERSISTED device settings — the
+        // wizard's input_setup step and the audio_engine Apply button both save
+        // them — not from this panel's selects, which are hydrated once at boot
+        // and are stale when a later plugin (note_detect's calibration) opens
+        // the selected input. Without this, the calibration challenge reopens
+        // the device at the default 256-sample buffer and the saved Focusrite
+        // config is lost.
+        let savedSettings = null;
+        try { savedSettings = await loadDeviceSettings(); } catch (_) { savedSettings = null; }
+        const savedInputType = savedSettings && (savedSettings.inputType || savedSettings.type)
+            ? String(savedSettings.inputType || savedSettings.type) : '';
+        const savedMatchesInput = !!(savedSettings
+            && typeof savedSettings.input === 'string'
+            && savedSettings.input.trim() === String(inputDevice).trim()
+            && (!savedInputType || !typeInfo || !typeInfo.name || savedInputType === String(typeInfo.name)));
+        let outputType = (typeInfo && typeInfo.name) ? String(typeInfo.name) : '';
+        let outputDevice = '';
+        if (savedMatchesInput && typeof savedSettings.output === 'string' && savedSettings.output.trim()) {
+            outputDevice = String(savedSettings.output);
+            if (savedSettings.outputType) outputType = String(savedSettings.outputType);
+        }
+        if (!outputDevice && typeInfo && Array.isArray(typeInfo.outputs)) {
+            // Duplex on the same physical device when the driver type exposes an
+            // output under the same name (Focusrite USB Audio in/out).
+            outputDevice = typeInfo.outputs.find(n => String(n).trim() === String(inputDevice).trim())
+                || typeInfo.outputs[0] || '';
+            if (outputDevice) outputType = (typeInfo && typeInfo.name) ? String(typeInfo.name) : outputType;
+        }
         const snapshot = currentAudioDeviceSnapshot();
+        if (!outputDevice) {
+            outputDevice = snapshot.outputDevice;
+            if (!outputType) outputType = snapshot.outputType || snapshot.inputType;
+        }
+        const sampleRate = savedMatchesInput && Number.isFinite(Number(savedSettings.sampleRate))
+            ? Number(savedSettings.sampleRate) : snapshot.sampleRate;
+        const bufferSize = savedMatchesInput && Number.isFinite(Number(savedSettings.bufferSize))
+            ? Number(savedSettings.bufferSize) : snapshot.bufferSize;
         const result = await api.setDevice({
-            inputType: typeInfo && typeInfo.name ? typeInfo.name : snapshot.inputType,
+            inputType: (typeInfo && typeInfo.name) ? String(typeInfo.name) : snapshot.inputType,
             inputDevice,
-            outputType: snapshot.outputType || (typeInfo && typeInfo.name) || snapshot.inputType,
-            outputDevice: snapshot.outputDevice,
-            sampleRate: snapshot.sampleRate,
-            bufferSize: snapshot.bufferSize,
+            outputType: outputType || snapshot.outputType || snapshot.inputType,
+            outputDevice,
+            sampleRate,
+            bufferSize,
         });
         const ok = typeof result === 'boolean' ? result : !!result?.ok;
         if (!ok) return { outcome: 'failed', status: 'failed', reason: result && result.error ? String(result.error) : 'Native audio device open failed' };
         if (typeof api.startAudio === 'function') await api.startAudio();
+        // The native engine boots with direct monitoring MUTED — without this,
+        // the first open after boot (the calibration challenge) is silent until
+        // the user finds the mute checkbox in this panel. A saved preference
+        // always wins; a fresh profile means audible monitoring.
+        const prefMute = savedSettings && typeof savedSettings.monitorMute === 'boolean' ? savedSettings.monitorMute : false;
+        const prefKill = savedSettings && typeof savedSettings.monitorKill === 'boolean' ? savedSettings.monitorKill : false;
+        try { if (typeof api.setMonitorMute === 'function') await api.setMonitorMute(prefMute); } catch (_) {}
+        try { if (typeof api.setMonitorKill === 'function') await api.setMonitorKill(prefKill); } catch (_) {}
 
         // Read back what the engine ACTUALLY bound, so callers (input_setup's
         // confirmation gate, note_detect) can surface "Now listening to: <device>"
@@ -1194,6 +1238,146 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
         }
     }
 
+    // Re-hydrate the panel from the persisted + live engine state. init()
+    // hydrates once per evaluation, but settings can change while this screen
+    // is hidden — the onboarding wizard's input_setup step persists the device
+    // config, the amp-sims opt-in lands in /api/settings — so without this the
+    // panel keeps showing the boot-time snapshot: guitar "not configured",
+    // buffer size back at the 256 default.
+    async function refreshPanelFromState() {
+        if (!api || typeof api.isAvailable !== 'function') return;
+        if (!deviceTypeSelect || !statusText || !toggleBtn) return;
+        let available = false;
+        try { available = await api.isAvailable(); } catch (_) { available = false; }
+        if (!available) return;
+
+        if (!currentDeviceTypes.length) {
+            try {
+                currentDeviceTypes = await api.getDeviceTypes();
+                populateDeviceTypeSelects(currentDeviceTypes);
+            } catch (e) {
+                console.warn('[audio-engine] refreshPanelFromState: getDeviceTypes failed:', e);
+                return;
+            }
+        }
+
+        // Live engine state first — it wins over both the saved file and the
+        // not-yet-applied panel selects.
+        let live = null;
+        try {
+            const running = typeof api.isAudioRunning === 'function' ? await api.isAudioRunning() : false;
+            audioRunning = !!running;
+            toggleBtn.textContent = running ? 'Stop' : 'Start';
+            statusDot.className = running
+                ? 'w-3 h-3 rounded-full bg-emerald-500'
+                : 'w-3 h-3 rounded-full bg-yellow-500';
+            if (running) {
+                statusText.textContent = 'Audio running';
+            } else if (/^Audio running/.test(statusText.textContent || '')) {
+                // Don't clobber a more specific boot error (probe failure,
+                // incompatible saved config) with a generic label — only
+                // replace our own "Audio running…" text.
+                statusText.textContent = 'Audio engine ready — not started';
+            }
+            if (typeof api.getCurrentDevice === 'function') live = await api.getCurrentDevice();
+        } catch (e) {
+            console.warn('[audio-engine] refreshPanelFromState: engine state read failed:', e);
+        }
+
+        const saved = await loadDeviceSettings();
+        if (saved) {
+            const savedInputType = saved.inputType || saved.type || '';
+            const savedOutputType = saved.outputType || saved.type || savedInputType;
+            if (savedInputType && selectHasValue(deviceTypeSelect, savedInputType)) {
+                deviceTypeSelect.value = savedInputType;
+                const inputTypeInfo = currentDeviceTypes.find(t => t.name === savedInputType);
+                if (inputTypeInfo) updateInputDeviceDropdown(inputTypeInfo);
+            }
+            if (savedOutputType && outputDeviceTypeSelect
+                && selectHasValue(outputDeviceTypeSelect, savedOutputType)) {
+                outputDeviceTypeSelect.value = savedOutputType;
+                const outputTypeInfo = currentDeviceTypes.find(t => t.name === savedOutputType);
+                if (outputTypeInfo) updateOutputDeviceDropdown(outputTypeInfo);
+            }
+            if ('input' in saved && selectHasValue(inputDeviceSelect, saved.input)) inputDeviceSelect.value = String(saved.input);
+            if ('output' in saved && selectHasValue(outputDeviceSelect, saved.output)) outputDeviceSelect.value = String(saved.output);
+            await refreshDeviceOptions({
+                sampleRate: saved.sampleRate,
+                bufferSize: saved.bufferSize,
+                inputChannel: saved.inputChannel,
+            });
+            setSelectValueIfPresent(sampleRateSelect, saved.sampleRate);
+            setSelectValueIfPresent(bufferSizeSelect, saved.bufferSize);
+            setSelectValueIfPresent(inputChannelSelect, saved.inputChannel);
+            if (saved.monitorMute !== undefined) monitorMuteCheckbox.checked = !!saved.monitorMute;
+            if (saved.monitorKill !== undefined) monitorKillCheckbox.checked = !!saved.monitorKill;
+        }
+
+        // When the engine is running it is the source of truth: ASIO drivers
+        // ignore buffer changes while open, so show what is ACTUALLY bound,
+        // never a buffer size the engine is not running.
+        if (audioRunning && live && typeof live === 'object') {
+            const liveInputType = live.inputType || live.type || '';
+            const liveOutputType = live.outputType || live.type || liveInputType;
+            if (liveInputType && selectHasValue(deviceTypeSelect, liveInputType)) {
+                deviceTypeSelect.value = liveInputType;
+                const inputTypeInfo = currentDeviceTypes.find(t => t.name === liveInputType);
+                if (inputTypeInfo) updateInputDeviceDropdown(inputTypeInfo);
+            }
+            if (liveOutputType && outputDeviceTypeSelect
+                && selectHasValue(outputDeviceTypeSelect, liveOutputType)) {
+                outputDeviceTypeSelect.value = liveOutputType;
+                const outputTypeInfo = currentDeviceTypes.find(t => t.name === liveOutputType);
+                if (outputTypeInfo) updateOutputDeviceDropdown(outputTypeInfo);
+            }
+            if (live.input && selectHasValue(inputDeviceSelect, live.input)) inputDeviceSelect.value = String(live.input);
+            if (live.output && selectHasValue(outputDeviceSelect, live.output)) outputDeviceSelect.value = String(live.output);
+            if (live.sampleRate > 0) {
+                await refreshDeviceOptions({ sampleRate: live.sampleRate, bufferSize: live.blockSize });
+                setSelectValueIfPresent(sampleRateSelect, live.sampleRate);
+                setSelectValueIfPresent(bufferSizeSelect, live.blockSize);
+            }
+            rememberAppliedDeviceSettings({
+                inputType: liveInputType,
+                outputType: liveOutputType,
+                input: live.input != null ? String(live.input) : '',
+                output: live.output != null ? String(live.output) : '',
+                sampleRate: live.sampleRate > 0 ? String(live.sampleRate) : '',
+                bufferSize: live.blockSize > 0 ? String(live.blockSize) : '',
+            });
+            // Keep the capability-side input selection in lockstep with the
+            // device the engine actually runs (same convergence init()'s
+            // auto-apply performs), so a later plugin open can't clobber the
+            // live device with a stale key.
+            syncSelectedInputSource(liveInputType, live.input);
+        }
+
+        await aeEnsureAmpSimsMonitoring();
+    }
+
+    // Make the amp-sim monitoring path match the persisted opt-in: the
+    // checkbox reflects the CURRENT /api/settings value (onboarding flips it
+    // after this panel first rendered, and init() reads it only once), and
+    // when opted in the live engine actually carries a tone chain so
+    // monitoring is not silent. Seeds an empty chain exactly like init()
+    // does — default preset first, saved chain as fallback; never clears a
+    // non-empty chain and never touches the chain when opted out.
+    async function aeEnsureAmpSimsMonitoring() {
+        if (!ampSimsCheckbox) return false;
+        const on = await aeUseAmpSims();
+        ampSimsCheckbox.checked = on;
+        if (!on) return false;
+        let chain = null;
+        try { chain = await api.getChainState(); } catch (_) { chain = null; }
+        if (Array.isArray(chain) && chain.length > 0) return true;
+        let loaded = false;
+        try { loaded = await loadDefaultPreset('amp-sims-ensure'); }
+        catch (e) { console.error('[audio-engine] default preset load failed (ensure):', e); }
+        if (!loaded) await aeRestoreSavedChain();
+        return true;
+    }
+    window._aeEnsureAmpSimsMonitoring = aeEnsureAmpSimsMonitoring;
+
     // Restore the persisted signal chain (VST/NAM/IR) into the engine. Shared by
     // app init (when amp sims are opted in) and the live "Use in-app amp sims"
     // opt-in toggle. Each item failure is contained so one bad plugin can't abort
@@ -1338,12 +1522,11 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
     }
 
     // ── Device Types ──────────────────────────────────────────────────────────
-    async function loadDeviceTypes() {
-        currentDeviceTypes = await api.getDeviceTypes();
+    function populateDeviceTypeSelects(types) {
         deviceTypeSelect.innerHTML = '';
         if (outputDeviceTypeSelect) outputDeviceTypeSelect.innerHTML = '';
 
-        for (const type of currentDeviceTypes) {
+        for (const type of types) {
             const opt = document.createElement('option');
             opt.value = type.name;
             opt.textContent = type.name;
@@ -1356,6 +1539,11 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
                 outputDeviceTypeSelect.appendChild(outOpt);
             }
         }
+    }
+
+    async function loadDeviceTypes() {
+        currentDeviceTypes = await api.getDeviceTypes();
+        populateDeviceTypeSelects(currentDeviceTypes);
 
         if (currentDeviceTypes.length > 0) {
             updateDeviceDropdowns(currentDeviceTypes[0]);
@@ -4282,6 +4470,22 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
         TA_CATEGORY_LABELS,
         TA_TARGET_ROWS,
     };
+
+    // Re-hydrate the panel every time this screen is shown. init() hydrates
+    // once per evaluation, but settings can change while the screen is hidden
+    // (the onboarding wizard's input_setup step persists the device config;
+    // the amp-sims opt-in lands in /api/settings) — without this the panel
+    // keeps showing the boot-time snapshot: guitar "not configured", buffer
+    // size back at the 256 default.
+    if (window.feedBack && typeof window.feedBack.on === 'function'
+        && !hookState.panelRehydrateInstalled) {
+        hookState.panelRehydrateInstalled = true;
+        window.feedBack.on('screen:changed', (ev) => {
+            const id = (ev && ev.detail && ev.detail.id) || (ev && ev.id);
+            if (id !== 'plugin-audio_engine') return;
+            refreshPanelFromState().catch(e => console.warn('[audio-engine] panel re-hydration failed:', e));
+        });
+    }
 
     // ── Start ─────────────────────────────────────────────────────────────────
     init().then(() => {

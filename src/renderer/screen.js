@@ -474,13 +474,23 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
         const ok = typeof result === 'boolean' ? result : !!result?.ok;
         if (!ok) return { outcome: 'failed', status: 'failed', reason: result && result.error ? String(result.error) : 'Native audio device open failed' };
         if (typeof api.startAudio === 'function') await api.startAudio();
-        // The native engine boots with direct monitoring MUTED — without this,
-        // the first open after boot (the calibration challenge) is silent until
-        // the user finds the mute checkbox in this panel. A saved preference
-        // always wins; a fresh profile means audible monitoring.
+        // The native engine boots with direct monitoring MUTED. Unmute on an
+        // automatic plugin open ONLY when the user opted into in-app amp sims
+        // (a loaded tone chain is meant to be heard). Otherwise leave the
+        // current mute state untouched: own-rig players monitoring through
+        // their external amp must not hear the dry guitar twice — once in-app,
+        // once through the rig — which reads as a horrible doubled, phased
+        // sound. An explicit mute preference always wins; so does monitorKill.
         const prefMute = savedSettings && typeof savedSettings.monitorMute === 'boolean' ? savedSettings.monitorMute : false;
         const prefKill = savedSettings && typeof savedSettings.monitorKill === 'boolean' ? savedSettings.monitorKill : false;
-        try { if (typeof api.setMonitorMute === 'function') await api.setMonitorMute(prefMute); } catch (_) {}
+        let ampSimsOn = false;
+        try { ampSimsOn = await aeUseAmpSims(); } catch (_) { ampSimsOn = false; }
+        try {
+            if (typeof api.setMonitorMute === 'function') {
+                if (prefMute) await api.setMonitorMute(true);
+                else if (ampSimsOn) await api.setMonitorMute(false);
+            }
+        } catch (_) {}
         try { if (typeof api.setMonitorKill === 'function') await api.setMonitorKill(prefKill); } catch (_) {}
 
         // Read back what the engine ACTUALLY bound, so callers (input_setup's
@@ -1190,15 +1200,21 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
             }
         }
 
-        // Fresh profile (no saved monitorMute): default direct monitoring to
-        // AUDIBLE. The HTML default leaves "Mute direct monitoring" checked
-        // and the native engine boots with monitorMuted{true}, so a first-run
-        // user hears silence until they find this toggle by hand. A saved
-        // preference always wins — this only fires when nothing was saved.
+        // Fresh profile (no saved monitorMute): the HTML default leaves
+        // "Mute direct monitoring" checked and the native engine boots with
+        // monitorMuted{true}. Only unmute when the user opted into in-app amp
+        // sims (a loaded tone chain is meant to be heard) — otherwise keep the
+        // boot mute so own-rig players don't hear the dry guitar twice (in-app
+        // + their external rig). A saved preference always wins — this only
+        // fires when nothing was saved.
         if (!saved || saved.monitorMute === undefined) {
-            monitorMuteCheckbox.checked = false;
-            try { await api.setMonitorMute(false); }
-            catch (e) { console.warn('[audio-engine] setMonitorMute fresh-default failed:', e); }
+            let freshAmpSimsOn = false;
+            try { freshAmpSimsOn = await aeUseAmpSims(); } catch (_) { freshAmpSimsOn = false; }
+            if (freshAmpSimsOn) {
+                monitorMuteCheckbox.checked = false;
+                try { await api.setMonitorMute(false); }
+                catch (e) { console.warn('[audio-engine] setMonitorMute fresh-default failed:', e); }
+            }
         }
 
         // Amp-sim opt-in gate (feedBack-desktop#46). Only auto-load a tone chain

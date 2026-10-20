@@ -111,18 +111,11 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
     window._aeDbToLinearGain = dbToLinearGain;
     window._aeFormatGainDbLabel = formatGainDbLabel;
 
-    // Buffer-size sanity: sub-64-sample buffers (some ASIO drivers advertise
-    // 16) clip badly with the in-app monitoring/processing chain, and an old
-    // build persisted such values. Never OPEN the engine below 64 samples;
-    // fall back to 256 when nothing sane is available.
-    const AE_MIN_BUFFER_SIZE = 64;
-    const AE_DEFAULT_BUFFER_SIZE = 256;
-    function saneBufferSize(value, fallback) {
-        const n = Number(value);
-        if (Number.isFinite(n) && n >= AE_MIN_BUFFER_SIZE) return n;
-        const fb = Number(fallback);
-        return (Number.isFinite(fb) && fb >= AE_MIN_BUFFER_SIZE) ? fb : AE_DEFAULT_BUFFER_SIZE;
-    }
+    // Buffer size is the user's explicit choice (Audio panel select, or the
+    // input_setup wizard fine-tune pick), persisted and opened as chosen —
+    // no floor, no clamp. Tiny ASIO buffers may clip with the in-app
+    // monitoring chain, but that latency/stability trade-off is the user's
+    // call, not the code's.
 
     // ── Persistence ─────────────────────────────────────────────────────────
     function captureDeviceSettings() {
@@ -457,12 +450,12 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
         }
         const sampleRate = savedMatchesInput && Number.isFinite(Number(savedSettings.sampleRate))
             ? Number(savedSettings.sampleRate) : snapshot.sampleRate;
-        // Never open below the buffer minimum: a stale sub-64 persist (the
-        // old 16-sample bind) or a stale panel value must not re-clip the
-        // engine on the next plugin open.
-        const bufferSize = saneBufferSize(
-            savedMatchesInput ? Number(savedSettings.bufferSize) : NaN,
-            saneBufferSize(snapshot.bufferSize, AE_DEFAULT_BUFFER_SIZE));
+        // The buffer size is the user's pick: reuse the persisted value when
+        // it describes this input, else the panel's current value. No floor,
+        // no clamp — the engine opens exactly as configured.
+        const bufferSize = savedMatchesInput && Number.isFinite(Number(savedSettings.bufferSize))
+            ? Number(savedSettings.bufferSize)
+            : snapshot.bufferSize;
         const result = await api.setDevice({
             inputType: (typeInfo && typeInfo.name) ? String(typeInfo.name) : snapshot.inputType,
             inputDevice,
@@ -760,16 +753,14 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
             .map(Number)
             .filter(Number.isFinite);
         const preferred = Number(preferredValue);
-        // A preferred buffer below the minimum (a stale 16-sample persist)
-        // must not be preselected — it would be applied at the next boot.
-        const preferredAvailable = Number.isFinite(preferred) && preferred >= AE_MIN_BUFFER_SIZE && values.includes(preferred);
+        // A preferred buffer is honoured whenever the driver offers it — it
+        // is the user's persisted choice (even a tiny ASIO buffer), not
+        // something to clamp away.
+        const preferredAvailable = Number.isFinite(preferred) && values.includes(preferred);
         const unique = Array.from(new Set(values)).sort((a, b) => a - b);
         // Fallback when the preferred value isn't offered: 256 when the driver
-        // has it, else the smallest value >= the minimum, else the largest
-        // available (exotic drivers that only offer tiny buffers).
-        const fallback = unique.find(v => v === AE_DEFAULT_BUFFER_SIZE)
-            ?? unique.find(v => v >= AE_MIN_BUFFER_SIZE)
-            ?? unique[unique.length - 1];
+        // has it, else the lowest available value.
+        const fallback = unique.find(v => v === 256) ?? unique[0];
         replaceSelectOptions(
             bufferSizeSelect,
             unique.map(size => ({ value: size, label: formatBufferOption(size, rate) })),
@@ -1131,7 +1122,7 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
             }
             if ('input' in saved && selectHasValue(inputDeviceSelect, saved.input)) inputDeviceSelect.value = String(saved.input);
             if ('output' in saved && selectHasValue(outputDeviceSelect, saved.output)) outputDeviceSelect.value = String(saved.output);
-            const savedBufferSize = saneBufferSize(saved.bufferSize, '');
+            const savedBufferSize = saved.bufferSize;
             const probedOptions = await refreshDeviceOptions({
                 sampleRate: saved.sampleRate,
                 bufferSize: savedBufferSize,
@@ -1177,7 +1168,7 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
                     outputType: outputDeviceTypeSelect?.value || deviceTypeSelect.value,
                     outputDevice: outputDeviceSelect.value,
                     sampleRate: parseFloat(sampleRateSelect.value || '48000'),
-                    bufferSize: saneBufferSize(parseInt(bufferSizeSelect.value || '256', 10)),
+                    bufferSize: parseInt(bufferSizeSelect.value || '256', 10),
                 });
                 const ok = typeof result === 'boolean' ? result : !!result?.ok;
                 if (ok) {
@@ -1345,11 +1336,11 @@ window.__feedBackDesktopAudioHooks = window.__feedBackDesktopAudioHooks || {};
             if ('output' in saved && selectHasValue(outputDeviceSelect, saved.output)) outputDeviceSelect.value = String(saved.output);
             await refreshDeviceOptions({
                 sampleRate: saved.sampleRate,
-                bufferSize: saneBufferSize(saved.bufferSize, ''),
+                bufferSize: saved.bufferSize,
                 inputChannel: saved.inputChannel,
             });
             setSelectValueIfPresent(sampleRateSelect, saved.sampleRate);
-            setSelectValueIfPresent(bufferSizeSelect, saneBufferSize(saved.bufferSize, ''));
+            setSelectValueIfPresent(bufferSizeSelect, saved.bufferSize);
             setSelectValueIfPresent(inputChannelSelect, saved.inputChannel);
             if (saved.monitorMute !== undefined) monitorMuteCheckbox.checked = !!saved.monitorMute;
             if (saved.monitorKill !== undefined) monitorKillCheckbox.checked = !!saved.monitorKill;

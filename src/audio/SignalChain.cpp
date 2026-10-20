@@ -236,6 +236,7 @@ void SignalChain::prepare(double sampleRate, int blockSize)
             p.setPlayConfigDetails(2, 2, sampleRate, blockSize);
             p.prepareToPlay(sampleRate, blockSize);
         });
+        sizeSlotForChannels(*slot, blockSize);
     }
 }
 
@@ -337,7 +338,31 @@ void SignalChain::processLocked(juce::AudioBuffer<float>& buffer, juce::MidiBuff
         for (int i = 0; i < numDrained; ++i)
             if (drained[i].slotId == slot->id || drained[i].slotId == -1)
                 slotMidi.addEvent(drained[i].msg, 0);
-        invokePlugin(*slot, [&](juce::AudioProcessor& p) { p.processBlock(buf, slotMidi); });
+        if (slot->pluginChannels > buf.getNumChannels())
+        {
+            // Multi-bus / wide-layout VST3 (e.g. Neural DSP Archetype reports
+            // extra output buses): JUCE's VST3 wrapper hands the plugin one raw
+            // pointer per plugin channel straight into the buffer we pass, so
+            // processing in place on the stereo chain bus would be a heap
+            // overwrite. Process into the per-slot scratch sized to the plugin,
+            // then fold the main bus (first channels) back into the chain
+            // buffer, like a DAW that only routes the main output.
+            juce::AudioBuffer<float>& scratch = slot->scratch;
+            if (scratch.getNumChannels() < slot->pluginChannels || scratch.getNumSamples() < numSamples)
+                scratch.setSize(slot->pluginChannels, numSamples, false, false, true);
+            const int copyCh = juce::jmin(buf.getNumChannels(), slot->pluginChannels);
+            for (int ch = 0; ch < copyCh; ++ch)
+                scratch.copyFrom(ch, 0, buf, ch, 0, numSamples);
+            for (int ch = copyCh; ch < slot->pluginChannels; ++ch)
+                scratch.clear(ch, 0, numSamples);
+            invokePlugin(*slot, [&](juce::AudioProcessor& p) { p.processBlock(scratch, slotMidi); });
+            for (int ch = 0; ch < copyCh; ++ch)
+                buf.copyFrom(ch, 0, scratch, ch, 0, numSamples);
+        }
+        else
+        {
+            invokePlugin(*slot, [&](juce::AudioProcessor& p) { p.processBlock(buf, slotMidi); });
+        }
         applyPan(buf, numSamples, slot->pan);
         if (slot->postGain != 1.0f)
             buf.applyGain(0, numSamples, slot->postGain);
@@ -447,6 +472,22 @@ static void prepareForPlayback(juce::AudioProcessor& p, double sampleRate, int b
     p.prepareToPlay(sampleRate, blockSize);
 }
 
+// Cache a slot's plugin channel count and pre-size its scratch. Called from the
+// prepare paths (off the audio thread); the RT path only reads pluginChannels
+// and reuses the pre-sized scratch, so it never allocates.
+static void sizeSlotForChannels(ProcessorSlot& slot, int blockSize)
+{
+    if (! slot.processor)
+    {
+        slot.pluginChannels = 2;
+        return;
+    }
+    slot.pluginChannels = juce::jmax(2, juce::jmax(slot.processor->getTotalNumInputChannels(),
+                                                     slot.processor->getTotalNumOutputChannels()));
+    if (slot.pluginChannels > 2 && blockSize > 0)
+        slot.scratch.setSize(slot.pluginChannels, blockSize, false, false, true);
+}
+
 int SignalChain::addProcessor(std::unique_ptr<juce::AudioProcessor> processor,
                                ProcessorSlot::Type type,
                                const juce::String& name,
@@ -494,6 +535,7 @@ int SignalChain::addProcessor(std::unique_ptr<juce::AudioProcessor> processor,
         });
         if (! slot->processor) return -1;
     }
+    sizeSlotForChannels(*slot, currentBlockSize);
     slots.add(slot.release());
     return id;
 }
@@ -537,6 +579,8 @@ bool SignalChain::replaceProcessor(int slotId, std::unique_ptr<juce::AudioProces
     });
     if (! staging.processor) return false;   // faulted during prepare → leave the slot as-is
 
+    sizeSlotForChannels(staging, currentBlockSize);
+
     std::unique_ptr<juce::AudioProcessor> old;
     {
         const juce::ScopedLock sl(lock);
@@ -563,6 +607,8 @@ bool SignalChain::replaceProcessor(int slotId, std::unique_ptr<juce::AudioProces
         auto* slot = slots[idx];
         old = std::move(slot->processor);
         slot->processor = std::move(staging.processor);
+        slot->pluginChannels = staging.pluginChannels;
+        slot->scratch = std::move(staging.scratch);
         // Swap succeeded: adopt the new identity so getChainState()/preset save
         // report the swapped-in processor, not the one it replaced. Only when
         // provided — the sandbox-promotion caller passes none and keeps identity.

@@ -35,6 +35,13 @@ struct ProcessorSlot
     // the per-amp loudness trim / per-branch level; 1.0 (default) = no-op.
     float postGain = 1.0f;
 
+    // Cached hasEditor(), resolved once at add time on the plugin's message
+    // thread (see resolveSlotHasEditor in SignalChain.cpp). The UI thread must
+    // never call hasEditor() on a native plugin — some plugins (Neural DSP
+    // Archetype/Gojira) fault in hasEditor() off their COM apartment — so
+    // getSlotSummaries()/openPluginEditor() read this flag instead.
+    bool hasEditor = false;
+
     // Channels the processor exposes across its buses — max(total in, total
     // out), floored at the chain's stereo width. A VST3 with extra buses or a
     // wide default layout (e.g. Neural DSP Archetype reports extra output

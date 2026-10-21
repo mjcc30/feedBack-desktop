@@ -7,7 +7,10 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { app } from 'electron';
 import { isDebugEnabled, getDebugLogPath } from './debug-log';
-import { initVstCrashGuard, armSentinel, disarmSentinel, armEditorSentinel, getSentinelPath } from './vst-crash-guard';
+import { initVstCrashGuard, armSentinel, disarmSentinel, armEditorSentinel, getSentinelPath,
+         getCrashBlocklist, removeFromCrashBlocklist, clearCrashBlocklist, consumeStartupBlocked } from './vst-crash-guard';
+import { IPC_VST_GET_CRASH_BLOCKLIST, IPC_VST_REMOVE_FROM_CRASH_BLOCKLIST,
+         IPC_VST_CLEAR_CRASH_BLOCKLIST, IPC_VST_EVENT_PLUGIN_BLOCKED } from './ipc-channels';
 import { createAudioEffectsExecutor } from './audio-effects-executor';
 
 type AudioModule = Record<string, (...args: any[]) => any>;
@@ -277,6 +280,20 @@ function loadNativeAddon(): AudioModule | null {
     return null;
 }
 
+// Broadcast any startup crash-blocklist promotions (plugins that crossed the
+// consecutive-crash threshold while the app was down) to every window. Called
+// from main.ts once the main renderer has painted — at initAudioBridge() time
+// only the splash window exists, and its preload has no vst listener, so an
+// immediate broadcast would be lost.
+export function flushVstBlockedNotifications(): void {
+    for (const entry of consumeStartupBlocked()) {
+        for (const win of BrowserWindow.getAllWindows()) {
+            if (!win.isDestroyed())
+                win.webContents.send(IPC_VST_EVENT_PLUGIN_BLOCKED, entry);
+        }
+    }
+}
+
 export function initAudioBridge(): void {
     audio = loadNativeAddon();
     const audioEffects = createAudioEffectsExecutor(() => audio);
@@ -325,6 +342,24 @@ export function initAudioBridge(): void {
             console.warn(`[audio] VST crash guard init failed: ${e.message}`);
         }
     }
+
+    // VST crash blocklist management (Settings → Audio). Every mutation
+    // re-pushes the list to the addon so routing changes apply immediately
+    // (a removed entry loads in-process again on its next load; a cleared
+    // list lifts every sandbox pin).
+    ipcMain.handle(IPC_VST_GET_CRASH_BLOCKLIST, () => getCrashBlocklist());
+    ipcMain.handle(IPC_VST_REMOVE_FROM_CRASH_BLOCKLIST, (_event, pluginPath: string) => {
+        const removed = removeFromCrashBlocklist(pluginPath);
+        if (removed && audio && typeof audio.setCrashedPlugins === 'function')
+            audio.setCrashedPlugins(getCrashBlocklist());
+        return removed;
+    });
+    ipcMain.handle(IPC_VST_CLEAR_CRASH_BLOCKLIST, () => {
+        const removed = clearCrashBlocklist();
+        if (removed && audio && typeof audio.setCrashedPlugins === 'function')
+            audio.setCrashedPlugins([]);
+        return removed;
+    });
 
     // Load the Basic Pitch ONNX model for the polyphonic ML note detector.
     // Bundled offline (Constitution IV) under resources/models/. Fail-soft:

@@ -220,6 +220,9 @@ SignalChain::~SignalChain()
     slots.clear();
 }
 
+// Forward decl — prepare() uses this before its definition further down.
+static void sizeSlotForChannels(ProcessorSlot& slot, int blockSize);
+
 void SignalChain::prepare(double sampleRate, int blockSize)
 {
     // Size the parallel-branch scratch once, off the audio thread. Stereo, the

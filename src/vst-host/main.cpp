@@ -1532,6 +1532,47 @@ static void installLinuxParentDeathSignal()
 #endif
 
 #if JUCE_WINDOWS
+// Runs one message-dispatch tick inside a native SEH __try/__except.
+// Isolated in its own function because MSVC error C2712 forbids __try in
+// functions that have C++ objects requiring unwinding (main() has several:
+// ScopedJuceInitialiser_GUI, HostState, std::jthread, ...). This helper has
+// only POD parameters (pointer + bool), so __try is legal here.
+//
+// Native SEH is used instead of C++ try/catch deliberately: with /EHa, a
+// C++ catch(...) unwinds through C++ destructors; if a plugin destructor
+// touches state that the faulting call left inconsistent, the destructor
+// itself faults during unwinding -> std::terminate -> silent death.
+// __try/__except unwinds via .pdata only (no destructor calls), so the
+// sandbox child survives. Leaked resources from skipped destructors are
+// acceptable: this is a disposable sandbox process.
+//
+// Contain plugin exceptions PER DISPATCH TICK: a misbehaving plugin (e.g.
+// PolyChrome DSP suites calling a bad function pointer from a timer/message
+// callback on this thread) raises an access violation during message
+// dispatch. Letting it escape would unwind into the thread-level catch-all
+// and kill the sandbox child — the host sees a broken pipe and the slot
+// goes permanently silent.
+static unsigned long long g_dispatchFaults = 0;
+
+static void runDispatchTickSehSafe(juce::MessageManager* mm, bool isLoadLoop)
+{
+    __try
+    {
+        mm->runDispatchLoopUntil(20);
+    }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+              ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    {
+        const unsigned long long faults = ++g_dispatchFaults;
+        if (faults <= 3 || faults % 100 == 0)
+            hostLogf("%s dispatch: access violation caught (fault #%llu) — "
+                     "continuing message loop",
+                     isLoadLoop ? "load" : "message", faults);
+    }
+}
+#endif // JUCE_WINDOWS
+
+#if JUCE_WINDOWS
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
     {
@@ -1793,7 +1834,14 @@ int main(int argc, char** argv)
         auto* mm = juce::MessageManager::getInstance();
         while (!loadDone.load(std::memory_order_acquire))
         {
+            // Same per-tick containment as the main dispatch loop: a plugin
+            // that faults during a load-time message callback must not kill
+            // the sandbox child before it can report ready.
+#if JUCE_WINDOWS
+            runDispatchTickSehSafe(mm, /*isLoadLoop=*/true);
+#else
             mm->runDispatchLoopUntil(20);
+#endif
             // If the host gives up and posts WM_QUIT (SubprocessHandle::
             // shutdown), the load is unrecoverable: createPluginInstanceAsync
             // can't be cancelled, and runDispatchLoopUntil stops pumping once
@@ -1979,7 +2027,18 @@ int main(int argc, char** argv)
     auto* mm = juce::MessageManager::getInstance();
     while (st.running.load(std::memory_order_acquire)
            && !mm->hasStopMessageBeenSent())
+    {
+        // Contain plugin exceptions PER DISPATCH TICK (see
+        // runDispatchTickSehSafe above for the rationale): a misbehaving
+        // plugin that raises an access violation during message dispatch
+        // must not kill the sandbox child — the host sees a broken pipe
+        // and the slot goes permanently silent.
+#if JUCE_WINDOWS
+        runDispatchTickSehSafe(mm, /*isLoadLoop=*/false);
+#else
         mm->runDispatchLoopUntil(20);
+#endif
+    }
 
     // The loop can exit because hasStopMessageBeenSent() is true while
     // st.running is still true (host sent WM_QUIT but never kShutdown).
